@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
@@ -8,6 +9,9 @@ const PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
 const DARWIN_PROCESS_IDENTITY_HELPER = fileURLToPath(
 	new URL("./native/darwin-process-identity", import.meta.url),
 );
+/** Cold Windows PowerShell start can exceed the POSIX helper budget. */
+const WIN32_PROCESS_IDENTITY_TIMEOUT_MS = 10_000;
+const WIN32_MAX_PID = 0xffff_ffff;
 
 export interface ProcessIdentity {
 	pid: number;
@@ -35,14 +39,30 @@ export type ProcessGroupStatus = "alive" | "dead" | "unknown";
 export function inspectProcessGroup(
 	processGroupId: number,
 ): ProcessGroupStatus {
-	if (
-		process.platform === "win32" ||
-		!Number.isSafeInteger(processGroupId) ||
-		processGroupId <= 0
-	)
+	if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0)
 		return "unknown";
+	if (process.platform === "win32") return inspectWin32ProcessGroupLeader(processGroupId);
 	try {
 		process.kill(-processGroupId, 0);
+		return "alive";
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException)?.code;
+		if (code === "ESRCH") return "dead";
+		if (code === "EPERM") return "alive";
+		return "unknown";
+	}
+}
+
+/**
+ * Windows has no POSIX process groups; win32 identities record the pid itself
+ * as the group id. Report the liveness of that leader process (signal 0 only
+ * tests existence on Windows too). Unlike a POSIX group probe this cannot see
+ * orphaned descendants; callers still pair it with the birth-time identity
+ * check, and the durable worker waits for its own children before exiting.
+ */
+function inspectWin32ProcessGroupLeader(pid: number): ProcessGroupStatus {
+	try {
+		process.kill(pid, 0);
 		return "alive";
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException)?.code;
@@ -147,6 +167,57 @@ async function inspectDarwinProcessIdentity(
 	}
 }
 
+/**
+ * Windows has no /proc and no POSIX process groups. Identity is the pid plus
+ * the process creation time (UTC FILETIME ticks, 100 ns since 1601), read via
+ * the system PowerShell by absolute path with a minimal environment. Creation
+ * time distinguishes a reused pid exactly as Linux start ticks do. Exit code 3
+ * means no such process (mirrors the darwin helper). The process group id is
+ * the pid itself, which the win32 branches elsewhere already expect.
+ */
+async function inspectWin32ProcessIdentity(
+	pid: number,
+): Promise<ProcessIdentityStatus> {
+	if (pid > WIN32_MAX_PID)
+		return { state: "unknown", reason: "Windows process pid is out of range" };
+	const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows";
+	const powershell = join(
+		systemRoot,
+		"System32",
+		"WindowsPowerShell",
+		"v1.0",
+		"powershell.exe",
+	);
+	// pid is a validated positive integer, so interpolating it is not an injection.
+	const script = `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($null -eq $p) { exit 3 }; [Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks)`;
+	try {
+		const { stdout } = await execFileAsync(
+			powershell,
+			["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+			{
+				timeout: WIN32_PROCESS_IDENTITY_TIMEOUT_MS,
+				maxBuffer: 64 * 1024,
+				windowsHide: true,
+				env: { SystemRoot: systemRoot },
+			},
+		);
+		const ticks = stdout.trim();
+		if (!/^\d+$/u.test(ticks))
+			return { state: "unknown", reason: "Windows process identity output is invalid" };
+		return {
+			state: "alive",
+			identity: { pid, processGroupId: pid, birthIdentity: `win32:${ticks}` },
+		};
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException)?.code;
+		if (String(code) === "3") return { state: "dead" };
+		return {
+			state: "unknown",
+			reason: `Windows process identity inspection failed: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`,
+		};
+	}
+}
+
 export async function inspectProcessIdentity(
 	pid: number,
 ): Promise<ProcessIdentityStatus> {
@@ -156,6 +227,8 @@ export async function inspectProcessIdentity(
 		return await inspectLinuxProcessIdentity(pid);
 	if (process.platform === "darwin")
 		return await inspectDarwinProcessIdentity(pid);
+	if (process.platform === "win32")
+		return await inspectWin32ProcessIdentity(pid);
 	return {
 		state: "unknown",
 		reason: `process identity is unsupported on ${process.platform}`,
