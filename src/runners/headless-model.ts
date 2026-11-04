@@ -3,7 +3,7 @@ import { createReadStream, createWriteStream, existsSync, readFileSync } from "n
 import { readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { findPackageRoot, hostPiPackageRoot } from "./inline.ts";
 import { buildAgentSystemPrompt, type AgentDefinition } from "../agents.ts";
@@ -591,6 +591,43 @@ function buildPrompt(options: RunHeadlessModelOptions): string {
 
 const PI_CODING_AGENT_PACKAGE = "@earendil-works/pi-coding-agent";
 
+/**
+ * Fallback for launches outside a Pi host, such as a standalone supervisor
+ * process: there is no Pi entry in process.argv and no inherited root, and
+ * require.resolve cannot see the package because it exports only `import`.
+ * Look for the installed package the way the `pi` command would be found:
+ * in a node_modules directory above this package (bundled installs), then
+ * next to a `pi.cmd`/`pi` launcher on PATH (npm global installs keep
+ * node_modules beside the launcher on Windows).
+ */
+function findInstalledWin32PiPackageRoot(): string | undefined {
+	const segments = PI_CODING_AGENT_PACKAGE.split("/");
+	const candidate = (base: string): string | undefined => {
+		const root = join(base, "node_modules", ...segments);
+		try {
+			const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
+				name?: unknown;
+			};
+			return manifest.name === PI_CODING_AGENT_PACKAGE ? root : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+	let current = dirname(fileURLToPath(import.meta.url));
+	while (current !== dirname(current)) {
+		const found = candidate(current);
+		if (found !== undefined) return found;
+		current = dirname(current);
+	}
+	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
+		if (entry.length === 0) continue;
+		if (!existsSync(join(entry, "pi.cmd")) && !existsSync(join(entry, "pi"))) continue;
+		const found = candidate(entry);
+		if (found !== undefined) return found;
+	}
+	return undefined;
+}
+
 function resolveWin32PiCliEntry(): string {
 	let root = hostPiPackageRoot();
 	if (root === undefined) {
@@ -601,6 +638,7 @@ function resolveWin32PiCliEntry(): string {
 			// Reported below with one actionable message.
 		}
 	}
+	root ??= findInstalledWin32PiPackageRoot();
 	if (root === undefined)
 		throw new Error(
 			`Could not locate ${PI_CODING_AGENT_PACKAGE} to launch pi on Windows; pass piCommand or set PI_SUBAGENT_PI_PACKAGE_ROOT.`,
