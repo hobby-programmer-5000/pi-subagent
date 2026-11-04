@@ -1,9 +1,11 @@
 import { once } from "node:events";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, readFileSync } from "node:fs";
 import { readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { findPackageRoot, hostPiPackageRoot } from "./inline.ts";
 import { buildAgentSystemPrompt, type AgentDefinition } from "../agents.ts";
 import {
 	createAttemptArtifactStore,
@@ -587,6 +589,48 @@ function buildPrompt(options: RunHeadlessModelOptions): string {
 		.join("\n\n");
 }
 
+const PI_CODING_AGENT_PACKAGE = "@earendil-works/pi-coding-agent";
+
+function resolveWin32PiCliEntry(): string {
+	let root = hostPiPackageRoot();
+	if (root === undefined) {
+		try {
+			const entry = createRequire(import.meta.url).resolve(PI_CODING_AGENT_PACKAGE);
+			root = findPackageRoot(entry, PI_CODING_AGENT_PACKAGE);
+		} catch {
+			// Reported below with one actionable message.
+		}
+	}
+	if (root === undefined)
+		throw new Error(
+			`Could not locate ${PI_CODING_AGENT_PACKAGE} to launch pi on Windows; pass piCommand or set PI_SUBAGENT_PI_PACKAGE_ROOT.`,
+		);
+	const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
+		bin?: string | Record<string, string>;
+	};
+	const bin = typeof manifest.bin === "string" ? manifest.bin : manifest.bin?.pi;
+	const cli = typeof bin === "string" ? join(root, bin) : undefined;
+	if (cli === undefined || !existsSync(cli))
+		throw new Error(`${PI_CODING_AGENT_PACKAGE} at ${root} has no pi CLI entry.`);
+	return cli;
+}
+
+/**
+ * Native Windows: the installed `pi` launcher is a `.cmd` shim, which spawn()
+ * without a shell cannot execute (ENOENT), and routing through cmd.exe would
+ * reintroduce argument-quoting hazards. Run the Pi CLI entry with the current
+ * Node binary instead. Only the default `pi` command is rewritten; an explicit
+ * piCommand is the caller's choice. POSIX argv is returned unchanged.
+ */
+export function resolveLaunchablePiArgv(
+	argv: readonly [string, ...string[]],
+	piCommand: string | undefined,
+): readonly [string, ...string[]] {
+	if (process.platform !== "win32" || piCommand !== undefined || argv[0] !== "pi")
+		return argv;
+	return [process.execPath, resolveWin32PiCliEntry(), ...argv.slice(1)];
+}
+
 export function buildPiArgv(
 	options: RunHeadlessModelOptions,
 ): readonly [string, ...string[]] {
@@ -1107,7 +1151,7 @@ export async function runHeadlessModel(
 		attemptId: options.attemptId,
 		runsDir: options.runsDir,
 	});
-	const argv = buildPiArgv(options);
+	const argv = resolveLaunchablePiArgv(buildPiArgv(options), options.piCommand);
 	const budget = normalizeToolResultBudget(options.toolResultBudget);
 	const budgetStatePath =
 		budget.budget === undefined

@@ -151,7 +151,7 @@ function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
 	return timeoutMs;
 }
 
-function findPackageRoot(
+export function findPackageRoot(
 	startPath: string,
 	packageName: string,
 ): string | undefined {
