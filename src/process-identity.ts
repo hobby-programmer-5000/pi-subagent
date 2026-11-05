@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -218,6 +218,156 @@ async function inspectWin32ProcessIdentity(
 	}
 }
 
+/**
+ * The same PowerShell lookup as inspectWin32ProcessIdentity, served by one
+ * long-lived helper per Node process: starting powershell.exe costs about
+ * 0.4 s idle and several seconds under load, which made liveness checks slow
+ * enough to delay stop confirmation and widen reconcile races. Requests are
+ * answered in order, one `<pid> <ticks>` / `<pid> dead` / `<pid> error ...`
+ * line each. The helper reads stdin until EOF, so it ends with its parent,
+ * and it is unreferenced while idle so it never keeps the parent alive.
+ */
+const WIN32_IDENTITY_HELPER_SCRIPT = [
+	"while ($null -ne ($line = [Console]::In.ReadLine())) {",
+	"  $id = 0",
+	"  if (-not [int]::TryParse($line, [ref]$id)) { [Console]::Out.WriteLine(\"$line error invalid pid\"); [Console]::Out.Flush(); continue }",
+	// GetProcessById returns the same Process object as Get-Process (so the
+	// same StartTime ticks) without cmdlet overhead; ArgumentException means
+	// no process with that id is running.
+	"  $p = $null; try { $p = [System.Diagnostics.Process]::GetProcessById($id) } catch [System.ArgumentException] { $p = $null }",
+	"  if ($null -eq $p) { [Console]::Out.WriteLine(\"$id dead\") }",
+	"  else { try { [Console]::Out.WriteLine(\"$id \" + $p.StartTime.ToUniversalTime().Ticks) } catch { [Console]::Out.WriteLine(\"$id error \" + ($_.Exception.Message -replace '\\s+', ' ')) } }",
+	"  [Console]::Out.Flush()",
+	"}",
+].join("\n");
+
+interface Win32IdentityRequest {
+	pid: number;
+	resolve: (line: string) => void;
+	reject: (error: Error) => void;
+	timer: ReturnType<typeof setTimeout>;
+}
+
+interface Win32IdentityHelper {
+	child: ChildProcessWithoutNullStreams;
+	pending: Win32IdentityRequest[];
+	buffer: string;
+	closed: boolean;
+}
+
+let win32IdentityHelper: Win32IdentityHelper | undefined;
+
+function win32PowerShellPath(): { powershell: string; systemRoot: string } {
+	const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows";
+	return {
+		systemRoot,
+		powershell: join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+	};
+}
+
+function setWin32HelperReferenced(helper: Win32IdentityHelper, referenced: boolean): void {
+	for (const handle of [helper.child, helper.child.stdin, helper.child.stdout, helper.child.stderr] as Array<{ ref?: () => void; unref?: () => void }>) {
+		if (referenced) handle.ref?.();
+		else handle.unref?.();
+	}
+}
+
+function closeWin32IdentityHelper(helper: Win32IdentityHelper, error: Error): void {
+	if (helper.closed) return;
+	helper.closed = true;
+	if (win32IdentityHelper === helper) win32IdentityHelper = undefined;
+	for (const request of helper.pending.splice(0)) {
+		clearTimeout(request.timer);
+		request.reject(error);
+	}
+	try {
+		helper.child.kill();
+	} catch {
+		// Already gone.
+	}
+}
+
+function startWin32IdentityHelper(): Win32IdentityHelper {
+	const { powershell, systemRoot } = win32PowerShellPath();
+	const encoded = Buffer.from(WIN32_IDENTITY_HELPER_SCRIPT, "utf16le").toString("base64");
+	const child = spawn(
+		powershell,
+		["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+		{ stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: { SystemRoot: systemRoot } },
+	);
+	const helper: Win32IdentityHelper = { child, pending: [], buffer: "", closed: false };
+	child.stdout.setEncoding("utf8");
+	child.stdout.on("data", (chunk: string) => {
+		helper.buffer += chunk;
+		for (;;) {
+			const newline = helper.buffer.indexOf("\n");
+			if (newline < 0) break;
+			const line = helper.buffer.slice(0, newline).trim();
+			helper.buffer = helper.buffer.slice(newline + 1);
+			if (line.length === 0) continue;
+			const request = helper.pending.shift();
+			if (request === undefined) continue;
+			clearTimeout(request.timer);
+			request.resolve(line);
+			if (helper.pending.length === 0) setWin32HelperReferenced(helper, false);
+		}
+	});
+	child.stderr.resume();
+	child.on("error", (error) => closeWin32IdentityHelper(helper, error));
+	child.on("exit", () => closeWin32IdentityHelper(helper, new Error("Windows process identity helper exited")));
+	child.stdin.on("error", (error) => closeWin32IdentityHelper(helper, error));
+	setWin32HelperReferenced(helper, false);
+	return helper;
+}
+
+function queryWin32IdentityHelper(pid: number): Promise<string> {
+	win32IdentityHelper ??= startWin32IdentityHelper();
+	const helper = win32IdentityHelper;
+	return new Promise((resolveLine, rejectLine) => {
+		const timer = setTimeout(
+			() => closeWin32IdentityHelper(helper, new Error("Windows process identity helper timed out")),
+			WIN32_PROCESS_IDENTITY_TIMEOUT_MS,
+		);
+		helper.pending.push({ pid, resolve: resolveLine, reject: rejectLine, timer });
+		setWin32HelperReferenced(helper, true);
+		helper.child.stdin.write(`${pid}\n`);
+	});
+}
+
+async function inspectWin32ProcessIdentityFast(
+	pid: number,
+): Promise<ProcessIdentityStatus> {
+	if (pid > WIN32_MAX_PID)
+		return { state: "unknown", reason: "Windows process pid is out of range" };
+	// ESRCH from signal 0 means no live process has this pid: the same answer
+	// the PowerShell lookup gives, without starting PowerShell.
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === "ESRCH") return { state: "dead" };
+	}
+	let line: string;
+	try {
+		line = await queryWin32IdentityHelper(pid);
+	} catch {
+		// Helper unavailable, crashed or timed out: use the one-shot lookup.
+		return await inspectWin32ProcessIdentity(pid);
+	}
+	const [answeredPid, value, ...rest] = line.split(" ");
+	if (answeredPid !== String(pid))
+		return { state: "unknown", reason: "Windows process identity helper answered out of order" };
+	if (value === "dead") return { state: "dead" };
+	if (value !== undefined && /^\d+$/u.test(value) && rest.length === 0)
+		return {
+			state: "alive",
+			identity: { pid, processGroupId: pid, birthIdentity: `win32:${value}` },
+		};
+	return {
+		state: "unknown",
+		reason: `Windows process identity inspection failed: ${[value, ...rest].join(" ")}`,
+	};
+}
+
 export async function inspectProcessIdentity(
 	pid: number,
 ): Promise<ProcessIdentityStatus> {
@@ -228,7 +378,7 @@ export async function inspectProcessIdentity(
 	if (process.platform === "darwin")
 		return await inspectDarwinProcessIdentity(pid);
 	if (process.platform === "win32")
-		return await inspectWin32ProcessIdentity(pid);
+		return await inspectWin32ProcessIdentityFast(pid);
 	return {
 		state: "unknown",
 		reason: `process identity is unsupported on ${process.platform}`,
