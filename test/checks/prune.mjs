@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createJiti } from "jiti";
+import { linkDirectory } from "../fixtures/platform-support.mjs";
 
 const indexDir = await mkdtemp(join(tmpdir(), "pi-subagent-prune-index-"));
 process.env.PI_SUBAGENT_RUN_INDEX_DIR = indexDir;
@@ -167,7 +168,7 @@ try {
 	);
 	const linkedCwd = await mkdtemp(join(tmpdir(), "pi-subagent-prune-linked-"));
 	await mkdir(join(linkedCwd, ".pi", "agent"), { recursive: true });
-	await symlink(outside, join(linkedCwd, ".pi", "agent", "runs"));
+	await linkDirectory(outside, join(linkedCwd, ".pi", "agent", "runs"));
 	await assert.rejects(
 		pruneSubagentRuns({ cwd: linkedCwd, keep: 0, yes: true }),
 		/refusing to prune through a symlink/u,
@@ -176,7 +177,7 @@ try {
 	await stat(join(outside, "run_victim", "run.json"));
 	const linkedEntryCwd = await mkdtemp(join(tmpdir(), "pi-subagent-prune-linked-entry-"));
 	await mkdir(join(linkedEntryCwd, ".pi", "agent", "runs"), { recursive: true });
-	await symlink(join(outside, "run_victim"), join(linkedEntryCwd, ".pi", "agent", "runs", "run_link"));
+	await linkDirectory(join(outside, "run_victim"), join(linkedEntryCwd, ".pi", "agent", "runs", "run_link"));
 	const linkedEntry = await pruneSubagentRuns({ cwd: linkedEntryCwd, keep: 0, yes: true });
 	assert.equal(linkedEntry.scanned, 0, "symlinked run entries are not scanned");
 	await stat(join(outside, "run_victim", "run.json"));
