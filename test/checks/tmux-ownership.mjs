@@ -44,6 +44,13 @@ import {
 import { beginRunRecord } from "../../src/artifacts/index.ts";
 import { checkTmuxRuntimeProbes } from "../fixtures/tmux-runtime-probes.mjs";
 
+if (process.platform === "win32") {
+	console.log(
+		"tmux ownership checks skipped: tmux, Unix sockets and uids are not available on native Windows",
+	);
+	process.exit(0);
+}
+
 const execFileAsync = promisify(execFile);
 const sleep = (ms) =>
 	new Promise((resolveSleep) => setTimeout(resolveSleep, ms));

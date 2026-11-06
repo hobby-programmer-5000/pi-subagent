@@ -33,6 +33,14 @@ import {
 	runSubagent,
 	waitForSubagent,
 } from "../../api.mjs";
+import {
+	isWin32,
+	logSkip,
+	prependPath,
+	rmTree,
+	sleeperCommand,
+	useFakePiPackage,
+} from "../fixtures/platform-support.mjs";
 
 const execFileAsync = promisify(execFile);
 const tempRoot = await mkdtemp(join(tmpdir(), "pi-subagent-reconcile-"));
@@ -256,7 +264,8 @@ try {
 		{ mode: 0o700 },
 	);
 	await chmod(fakePi, 0o700);
-	process.env.PATH = `${orphanBin}:${originalPath}`;
+	process.env.PATH = prependPath(orphanBin, originalPath);
+	const restoreFakePi = useFakePiPackage(fakePi, orphanBin);
 	const orphanRun = await runSubagent({
 		cwd: orphanCwd,
 		backend: "headless",
@@ -301,10 +310,11 @@ try {
 		"orphaned execution must not perform a late side effect",
 	);
 	process.env.PATH = originalPath;
+	restoreFakePi();
 
 	const workerRaceCwd = join(tempRoot, "worker-metadata-race");
 	const executionIdentity = await captureProcessIdentity(process.pid);
-	workerRaceProbe = spawn("/bin/sleep", ["30"], {
+	workerRaceProbe = spawn(...sleeperCommand(), {
 		detached: true,
 		stdio: "ignore",
 	});
@@ -692,7 +702,7 @@ try {
 	);
 
 	const unrelatedCwd = join(tempRoot, "unrelated-process");
-	unrelatedProcess = spawn("/bin/sleep", ["30"], {
+	unrelatedProcess = spawn(...sleeperCommand(), {
 		detached: true,
 		stdio: "ignore",
 	});
@@ -783,7 +793,7 @@ try {
 		],
 		{ detached: true, stdio: "ignore" },
 	);
-	partialCleanupUnrelated = spawn("/bin/sleep", ["30"], {
+	partialCleanupUnrelated = spawn(...sleeperCommand(), {
 		detached: true,
 		stdio: "ignore",
 	});
@@ -850,7 +860,7 @@ try {
 		],
 		{ detached: true, stdio: "ignore" },
 	);
-	incompleteCleanupUnrelated = spawn("/bin/sleep", ["30"], {
+	incompleteCleanupUnrelated = spawn(...sleeperCommand(), {
 		detached: true,
 		stdio: "ignore",
 	});
@@ -898,7 +908,7 @@ try {
 
 	const terminalAllAttemptsCwd = join(tempRoot, "terminal-all-attempts");
 	await mkdir(terminalAllAttemptsCwd, { recursive: true });
-	terminalOlderAttemptChild = spawn("/bin/sleep", ["30"], {
+	terminalOlderAttemptChild = spawn(...sleeperCommand(), {
 		detached: true,
 		stdio: "ignore",
 	});
@@ -945,150 +955,160 @@ try {
 		"terminal reconciliation must clean ownership from every attempt",
 	);
 
-	const deadLeaderCwd = join(tempRoot, "dead-group-leader");
-	const deadLeaderPidPath = join(deadLeaderCwd, "child.pid");
-	const deadLeaderSideEffect = join(deadLeaderCwd, "late-side-effect");
-	await mkdir(deadLeaderCwd, { recursive: true });
-	const deadLeader = spawn(
-		"/bin/bash",
-		[
-			"-c",
-			`${JSON.stringify(process.execPath)} --input-type=module -e 'import { writeFileSync } from "node:fs"; process.on("SIGTERM", () => {}); await new Promise((resolve) => setTimeout(resolve, 3000)); writeFileSync(${JSON.stringify(deadLeaderSideEffect)}, "late"); await new Promise((resolve) => setTimeout(resolve, 10000));' ignored-sigterm-child & echo $! > ${JSON.stringify(deadLeaderPidPath)}; wait`,
-		],
-		{ detached: true, stdio: "ignore" },
-	);
-	assert.equal(typeof deadLeader.pid, "number");
-	const deadLeaderIdentity = await captureProcessIdentity(deadLeader.pid);
-	for (
-		let index = 0;
-		index < 100 && !(await pathExists(deadLeaderPidPath));
-		index += 1
-	)
-		await sleep(10);
-	deadLeaderChildPid = Number(
-		(await readFile(deadLeaderPidPath, "utf8")).trim(),
-	);
-	assert.equal(pidAlive(deadLeaderChildPid), true);
-	await sleep(100);
-	await createRunningAttempt(
-		deadLeaderCwd,
-		"run_reconcile_dead_group_leader",
-		"attempt_dead_group_leader",
-		{
-			process: {
-				pid: deadLeaderIdentity.pid,
-				processGroupId: deadLeaderIdentity.processGroupId,
-				processBirthIdentity: deadLeaderIdentity.birthIdentity,
+	// Process groups, a group leader that dies before its children, and macOS
+	// EPERM on group signals are POSIX semantics. Windows has no process groups
+	// (identities record the pid itself), so these two cases do not apply there.
+	if (isWin32)
+		logSkip(
+			"dead group leader and group-signal EPERM checks",
+			"win32 has no POSIX process groups",
+		);
+	else {
+		const deadLeaderCwd = join(tempRoot, "dead-group-leader");
+		const deadLeaderPidPath = join(deadLeaderCwd, "child.pid");
+		const deadLeaderSideEffect = join(deadLeaderCwd, "late-side-effect");
+		await mkdir(deadLeaderCwd, { recursive: true });
+		const deadLeader = spawn(
+			"/bin/bash",
+			[
+				"-c",
+				`${JSON.stringify(process.execPath)} --input-type=module -e 'import { writeFileSync } from "node:fs"; process.on("SIGTERM", () => {}); await new Promise((resolve) => setTimeout(resolve, 3000)); writeFileSync(${JSON.stringify(deadLeaderSideEffect)}, "late"); await new Promise((resolve) => setTimeout(resolve, 10000));' ignored-sigterm-child & echo $! > ${JSON.stringify(deadLeaderPidPath)}; wait`,
+			],
+			{ detached: true, stdio: "ignore" },
+		);
+		assert.equal(typeof deadLeader.pid, "number");
+		const deadLeaderIdentity = await captureProcessIdentity(deadLeader.pid);
+		for (
+			let index = 0;
+			index < 100 && !(await pathExists(deadLeaderPidPath));
+			index += 1
+		)
+			await sleep(10);
+		deadLeaderChildPid = Number(
+			(await readFile(deadLeaderPidPath, "utf8")).trim(),
+		);
+		assert.equal(pidAlive(deadLeaderChildPid), true);
+		await sleep(100);
+		await createRunningAttempt(
+			deadLeaderCwd,
+			"run_reconcile_dead_group_leader",
+			"attempt_dead_group_leader",
+			{
+				process: {
+					pid: deadLeaderIdentity.pid,
+					processGroupId: deadLeaderIdentity.processGroupId,
+					processBirthIdentity: deadLeaderIdentity.birthIdentity,
+				},
+				heartbeatAt: new Date(Date.now() - 60_000).toISOString(),
 			},
-			heartbeatAt: new Date(Date.now() - 60_000).toISOString(),
-		},
-	);
-	process.kill(deadLeader.pid, "SIGKILL");
-	for (let index = 0; index < 100 && pidAlive(deadLeader.pid); index += 1)
-		await sleep(10);
-	const deadLeaderReconcile = await reconcileSubagentRun({
-		cwd: deadLeaderCwd,
-		runId: "run_reconcile_dead_group_leader",
-		staleAfterMs: 1,
-	});
-	assert.equal(
-		deadLeaderReconcile.status,
-		"cleanup-blocked",
-		"a dead leader with a non-drained owned group must block terminal state",
-	);
-	assert.equal(pidAlive(deadLeaderChildPid), true);
-	assert.equal(deadLeaderReconcile.record?.status, "running");
-	process.kill(-deadLeaderIdentity.processGroupId, "SIGKILL");
-	for (
-		let index = 0;
-		index < 100 && pidAlive(deadLeaderChildPid);
-		index += 1
-	)
-		await sleep(10);
-	await sleep(900);
-	await assert.rejects(access(deadLeaderSideEffect));
-
-	// macOS answers a process-group signal with EPERM while the group holds only
-	// an unreaped zombie. Reconciliation must treat that as "not delivered" and
-	// let its liveness checks decide, never throw out of the initial SIGTERM.
-	const epermCwd = join(tempRoot, "eperm-group");
-	epermProcess = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
-	assert.equal(typeof epermProcess.pid, "number");
-	const epermIdentity = await captureProcessIdentity(epermProcess.pid);
-	// A terminal result with a lingering owned process group: reconcile commits
-	// the result only after draining the group, which starts with SIGTERM.
-	const epermStore = await createAttemptArtifactStore({
-		cwd: epermCwd,
-		runId: "run_reconcile_eperm",
-		attemptId: "attempt_eperm",
-	});
-	const epermEnvelope = await epermStore.writeResult({
-		backend: "headless",
-		status: "completed",
-		failureKind: null,
-		cwd: epermCwd,
-		startedAt: new Date().toISOString(),
-		completedAt: new Date().toISOString(),
-		workspace: { mode: "shared", cwd: epermCwd, worktreePath: null },
-		sandbox: { enabled: false },
-		exitCode: 0,
-		signal: null,
-		artifacts: [],
-		metadata: { contextLengthExceeded: false },
-	});
-	// The owning durable worker is already dead; only the child group lingers.
-	const epermWorker = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
-	const epermWorkerIdentity = await captureProcessIdentity(epermWorker.pid);
-	epermWorker.kill("SIGKILL");
-	for (let index = 0; index < 100 && pidAlive(epermWorker.pid); index += 1) await sleep(10);
-	await createRunningAttempt(epermCwd, "run_reconcile_eperm", "attempt_eperm", {
-		heartbeatAt: new Date(Date.now() - 60_000).toISOString(),
-		process: {
-			pid: epermIdentity.pid,
-			processGroupId: epermIdentity.processGroupId,
-			processBirthIdentity: epermIdentity.birthIdentity,
-			workerPid: epermWorkerIdentity.pid,
-			workerProcessGroupId: epermWorkerIdentity.processGroupId,
-			workerProcessBirthIdentity: epermWorkerIdentity.birthIdentity,
-			command: "headless child",
-		},
-		resultPath: epermEnvelope.artifacts.find((artifact) => artifact.type === "result")?.path,
-	});
-	const realKillForEperm = process.kill;
-	let epermGroupSignals = 0;
-	process.kill = function epermGroupKill(pid, signal) {
-		if (typeof pid === "number" && pid < 0 && signal !== 0 && signal !== undefined) {
-			epermGroupSignals += 1;
-			// The real process keeps running; simulate the kernel refusing delivery.
-			throw Object.assign(new Error("kill EPERM"), { code: "EPERM", errno: -1, syscall: "kill" });
-		}
-		return realKillForEperm.call(process, pid, signal);
-	};
-	let epermReconcile;
-	try {
-		epermReconcile = await reconcileSubagentRun({
-			cwd: epermCwd,
-			runId: "run_reconcile_eperm",
+		);
+		process.kill(deadLeader.pid, "SIGKILL");
+		for (let index = 0; index < 100 && pidAlive(deadLeader.pid); index += 1)
+			await sleep(10);
+		const deadLeaderReconcile = await reconcileSubagentRun({
+			cwd: deadLeaderCwd,
+			runId: "run_reconcile_dead_group_leader",
 			staleAfterMs: 1,
 		});
-	} finally {
-		process.kill = realKillForEperm;
+		assert.equal(
+			deadLeaderReconcile.status,
+			"cleanup-blocked",
+			"a dead leader with a non-drained owned group must block terminal state",
+		);
+		assert.equal(pidAlive(deadLeaderChildPid), true);
+		assert.equal(deadLeaderReconcile.record?.status, "running");
+		process.kill(-deadLeaderIdentity.processGroupId, "SIGKILL");
+		for (
+			let index = 0;
+			index < 100 && pidAlive(deadLeaderChildPid);
+			index += 1
+		)
+			await sleep(10);
+		await sleep(900);
+		await assert.rejects(access(deadLeaderSideEffect));
+
+		// macOS answers a process-group signal with EPERM while the group holds only
+		// an unreaped zombie. Reconciliation must treat that as "not delivered" and
+		// let its liveness checks decide, never throw out of the initial SIGTERM.
+		const epermCwd = join(tempRoot, "eperm-group");
+		epermProcess = spawn(...sleeperCommand(), { detached: true, stdio: "ignore" });
+		assert.equal(typeof epermProcess.pid, "number");
+		const epermIdentity = await captureProcessIdentity(epermProcess.pid);
+		// A terminal result with a lingering owned process group: reconcile commits
+		// the result only after draining the group, which starts with SIGTERM.
+		const epermStore = await createAttemptArtifactStore({
+			cwd: epermCwd,
+			runId: "run_reconcile_eperm",
+			attemptId: "attempt_eperm",
+		});
+		const epermEnvelope = await epermStore.writeResult({
+			backend: "headless",
+			status: "completed",
+			failureKind: null,
+			cwd: epermCwd,
+			startedAt: new Date().toISOString(),
+			completedAt: new Date().toISOString(),
+			workspace: { mode: "shared", cwd: epermCwd, worktreePath: null },
+			sandbox: { enabled: false },
+			exitCode: 0,
+			signal: null,
+			artifacts: [],
+			metadata: { contextLengthExceeded: false },
+		});
+		// The owning durable worker is already dead; only the child group lingers.
+		const epermWorker = spawn(...sleeperCommand(), { detached: true, stdio: "ignore" });
+		const epermWorkerIdentity = await captureProcessIdentity(epermWorker.pid);
+		epermWorker.kill("SIGKILL");
+		for (let index = 0; index < 100 && pidAlive(epermWorker.pid); index += 1) await sleep(10);
+		await createRunningAttempt(epermCwd, "run_reconcile_eperm", "attempt_eperm", {
+			heartbeatAt: new Date(Date.now() - 60_000).toISOString(),
+			process: {
+				pid: epermIdentity.pid,
+				processGroupId: epermIdentity.processGroupId,
+				processBirthIdentity: epermIdentity.birthIdentity,
+				workerPid: epermWorkerIdentity.pid,
+				workerProcessGroupId: epermWorkerIdentity.processGroupId,
+				workerProcessBirthIdentity: epermWorkerIdentity.birthIdentity,
+				command: "headless child",
+			},
+			resultPath: epermEnvelope.artifacts.find((artifact) => artifact.type === "result")?.path,
+		});
+		const realKillForEperm = process.kill;
+		let epermGroupSignals = 0;
+		process.kill = function epermGroupKill(pid, signal) {
+			if (typeof pid === "number" && pid < 0 && signal !== 0 && signal !== undefined) {
+				epermGroupSignals += 1;
+				// The real process keeps running; simulate the kernel refusing delivery.
+				throw Object.assign(new Error("kill EPERM"), { code: "EPERM", errno: -1, syscall: "kill" });
+			}
+			return realKillForEperm.call(process, pid, signal);
+		};
+		let epermReconcile;
+		try {
+			epermReconcile = await reconcileSubagentRun({
+				cwd: epermCwd,
+				runId: "run_reconcile_eperm",
+				staleAfterMs: 1,
+			});
+		} finally {
+			process.kill = realKillForEperm;
+		}
+		assert.ok(epermGroupSignals >= 1, `reconcile attempted a process-group signal: ${JSON.stringify(epermReconcile)}`);
+		assert.equal(
+			epermReconcile.status,
+			"cleanup-blocked",
+			`EPERM on a live group must surface as cleanup-blocked, not throw: ${JSON.stringify(epermReconcile)}`,
+		);
+		assert.equal(pidAlive(epermProcess.pid), true, "the live process was not killed through the patched path");
+		// Once the process is actually gone, the same run reconciles to a terminal state.
+		realKillForEperm.call(process, epermProcess.pid, "SIGKILL");
+		for (let index = 0; index < 100 && pidAlive(epermProcess.pid); index += 1) await sleep(10);
+		const epermAfter = await reconcileSubagentRun({ cwd: epermCwd, runId: "run_reconcile_eperm", staleAfterMs: 1 });
+		assert.ok(
+			["committed-result", "already-terminal"].includes(epermAfter.status),
+			`dead process lets the terminal result commit: ${JSON.stringify(epermAfter)}`,
+		);
 	}
-	assert.ok(epermGroupSignals >= 1, `reconcile attempted a process-group signal: ${JSON.stringify(epermReconcile)}`);
-	assert.equal(
-		epermReconcile.status,
-		"cleanup-blocked",
-		`EPERM on a live group must surface as cleanup-blocked, not throw: ${JSON.stringify(epermReconcile)}`,
-	);
-	assert.equal(pidAlive(epermProcess.pid), true, "the live process was not killed through the patched path");
-	// Once the process is actually gone, the same run reconciles to a terminal state.
-	realKillForEperm.call(process, epermProcess.pid, "SIGKILL");
-	for (let index = 0; index < 100 && pidAlive(epermProcess.pid); index += 1) await sleep(10);
-	const epermAfter = await reconcileSubagentRun({ cwd: epermCwd, runId: "run_reconcile_eperm", staleAfterMs: 1 });
-	assert.ok(
-		["committed-result", "already-terminal"].includes(epermAfter.status),
-		`dead process lets the terminal result commit: ${JSON.stringify(epermAfter)}`,
-	);
 
 	console.log(
 		JSON.stringify({ name: "check-reconcile", status: "completed" }, null, 2),
@@ -1149,5 +1169,5 @@ try {
 			// The owned fixture process already exited.
 		}
 	}
-	await rm(tempRoot, { recursive: true, force: true });
+	await rmTree(tempRoot);
 }
