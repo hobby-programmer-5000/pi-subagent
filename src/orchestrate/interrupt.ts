@@ -100,12 +100,28 @@ async function verifyInterruptTargets(
 /**
  * Windows has no catchable SIGTERM: process.kill() terminates the process at
  * once. Killing the durable worker that way leaves its attempt without a
- * terminal result, because only the worker records it. So on win32 a
- * graceful signal stops only the model child, and the worker then records
- * the outcome and exits by itself; the worker is signalled only at SIGKILL
- * escalation, or when it has no live child to stop. POSIX delivers the
- * signal to every target as before.
+ * terminal result, because only the worker records it, and killing only the
+ * model child makes the worker record a failure instead of a cancellation.
+ * So on win32 a graceful request (initial or SIGTERM escalation) for an
+ * attempt with a live worker signals nothing: interruptRun records the
+ * request, the worker sees it and cancels itself (stopping its model child)
+ * as a POSIX SIGTERM would make it do. SIGKILL escalation still ends every
+ * target, and then finalizes an attempt the worker did not finish (see
+ * escalate). Without a live worker a graceful signal stops only the model
+ * child. POSIX delivers the signal to every target as before.
  */
+async function win32WorkerObservesInterrupt(
+	targets: readonly VerifiedInterruptTarget[],
+	signal: NodeJS.Signals,
+): Promise<boolean> {
+	if (process.platform !== "win32" || signal === "SIGKILL") return false;
+	const worker = targets.find((target) => target.worker === true);
+	return (
+		worker !== undefined &&
+		(await verifyProcessIdentity(worker.identity)) === "alive"
+	);
+}
+
 function win32GracefulTargets(
 	targets: readonly VerifiedInterruptTarget[],
 	signal: NodeJS.Signals,
@@ -119,6 +135,7 @@ async function signalVerifiedTargets(
 	allTargets: readonly VerifiedInterruptTarget[],
 	signal: NodeJS.Signals,
 ): Promise<boolean> {
+	if (await win32WorkerObservesInterrupt(allTargets, signal)) return true;
 	let signalled = false;
 	const targets = win32GracefulTargets(allTargets, signal);
 	for (const { identity, target } of targets) {
@@ -170,6 +187,29 @@ async function escalate(
 		message: `interrupt escalation ${signal}`,
 		data: { signal },
 	}).catch(() => undefined);
+	// win32: SIGKILL ended a worker that had not recorded a result (one that
+	// does not watch for the request). Nothing else would finalize the attempt,
+	// so once its processes are gone let reconcile mark it cancelled, as
+	// interruptRun does for an attempt found with every process gone.
+	if (process.platform === "win32" && signal === "SIGKILL")
+		await finalizeWin32KilledAttempts(ref, verifiedTargets).catch(() => undefined);
+}
+
+async function finalizeWin32KilledAttempts(
+	ref: Awaited<ReturnType<typeof resolveRunRef>>,
+	verifiedTargets: ReadonlyMap<string, readonly VerifiedInterruptTarget[]>,
+): Promise<void> {
+	const targets = [...verifiedTargets.values()].flat();
+	for (let index = 0; index < 40; index += 1) {
+		const states = await Promise.all(
+			targets.map((target) => verifyProcessIdentity(target.identity)),
+		);
+		if (states.every((state) => state !== "alive")) break;
+		await new Promise((resolveSleep) => setTimeout(resolveSleep, 50));
+	}
+	const record = await readRunRecord(ref).catch(() => null);
+	if (record === null || isTerminalStatus(record.status)) return;
+	await reconcileSubagentRun({ ...ref, staleAfterMs: 0 });
 }
 
 function result(

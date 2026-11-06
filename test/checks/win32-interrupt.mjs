@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // Native Windows stop path. process.kill() ends a process immediately there,
-// so a graceful interrupt must stop only the model child and leave the durable
-// worker to record the result; the worker is killed only at SIGKILL escalation.
+// so a graceful interrupt of an attempt with a live durable worker signals
+// nothing: it records the request, and the worker cancels itself and records
+// the result. SIGKILL escalation ends every process and finalizes the attempt.
 // An attempt whose processes are already gone must still be finalized.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
@@ -51,24 +52,6 @@ function startProcess(source, ...args) {
 }
 
 const startSleeper = () => startProcess("setTimeout(() => {}, 60000)");
-
-// Stands in for the durable worker: records that it saw its child exit, then
-// exits by itself. With `stubborn` it never exits, to exercise escalation.
-function startWorker(childPid, marker, stubborn = false) {
-	return startProcess(
-		`const fs = require("node:fs");
-		const [childPid, marker, stubborn] = process.argv.slice(1);
-		const timer = setInterval(() => {
-			try { process.kill(Number(childPid), 0); return; } catch {}
-			clearInterval(timer);
-			fs.writeFileSync(marker, "worker saw child exit");
-			if (stubborn === "true") setTimeout(() => {}, 60000);
-		}, 20);`,
-		String(childPid),
-		marker,
-		String(stubborn),
-	);
-}
 
 async function createAttempt(name, child, worker) {
 	const cwd = join(root, name);
@@ -123,45 +106,55 @@ async function createAttempt(name, child, worker) {
 }
 
 try {
-	// A graceful interrupt stops the child only; the worker finishes by itself.
+	// A graceful interrupt with a live worker signals nothing: it records the
+	// request, which the durable worker watches for and acts on itself.
 	{
 		const child = startSleeper();
-		const marker = join(root, "graceful-marker.txt");
-		const worker = startWorker(child.child.pid, marker);
+		const worker = startSleeper();
 		const ref = await createAttempt("graceful", child.child, worker.child);
 		const result = await interruptRun({ ...ref, escalateAfterMs: 60_000, killAfterMs: 60_000 });
 		assert.equal(result.status, "interrupt-requested");
 		assert.deepEqual(result.interruptedAttempts, [ref.attemptId]);
-		await waitUntil(() => !pidAlive(child.child.pid), "the model child to stop");
-		assert.equal(await worker.exited, 0, "the worker must exit by itself, not be terminated");
-		assert.equal(await readFile(marker, "utf8"), "worker saw child exit");
+		assert.equal(result.record?.interrupt?.signal, "SIGTERM");
+		await sleep(500);
+		assert.equal(pidAlive(child.child.pid), true, "a graceful request must not terminate the model child");
+		assert.equal(pidAlive(worker.child.pid), true, "a graceful request must not terminate the worker");
 	}
 
-	// SIGTERM escalation still spares the worker; SIGKILL escalation ends it.
-	{
-		const child = startSleeper();
-		const marker = join(root, "stubborn-marker.txt");
-		const worker = startWorker(child.child.pid, marker, true);
-		const ref = await createAttempt("stubborn", child.child, worker.child);
-		const result = await interruptRun({ ...ref, escalateAfterMs: 100, killAfterMs: 1_500 });
-		assert.equal(result.status, "interrupt-requested");
-		await waitUntil(() => !pidAlive(child.child.pid), "the model child to stop");
-		await sleep(600);
-		assert.equal(pidAlive(worker.child.pid), true, "SIGTERM escalation must not end the worker");
-		assert.equal(await readFile(marker, "utf8"), "worker saw child exit");
-		await waitUntil(() => !pidAlive(worker.child.pid), "SIGKILL escalation to end the worker");
-	}
-
-	// With no child recorded alive, a graceful interrupt falls back to the worker.
+	// SIGTERM escalation still signals nothing; SIGKILL escalation ends every
+	// process of a worker that did not act, and the attempt ends cancelled.
 	{
 		const child = startSleeper();
 		const worker = startSleeper();
-		const ref = await createAttempt("worker-only", child.child, worker.child);
-		child.child.kill();
-		await child.exited;
+		const ref = await createAttempt("stubborn", child.child, worker.child);
+		const result = await interruptRun({ ...ref, escalateAfterMs: 100, killAfterMs: 1_500 });
+		assert.equal(result.status, "interrupt-requested");
+		await sleep(600);
+		assert.equal(pidAlive(child.child.pid), true, "SIGTERM escalation must not terminate the model child");
+		assert.equal(pidAlive(worker.child.pid), true, "SIGTERM escalation must not terminate the worker");
+		await waitUntil(
+			() => !pidAlive(child.child.pid) && !pidAlive(worker.child.pid),
+			"SIGKILL escalation to end the child and the worker",
+		);
+		await waitUntil(
+			async () => (await artifacts.readRunRecord(ref))?.status === "cancelled",
+			"the killed attempt to be finalized as cancelled",
+		);
+		const record = await artifacts.readRunRecord(ref);
+		assert.equal(record?.attempts[0]?.status, "cancelled");
+		assert.equal(record?.failureKind, "user_cancelled");
+	}
+
+	// Without a live worker, a graceful interrupt stops only the model child.
+	{
+		const child = startSleeper();
+		const worker = startSleeper();
+		const ref = await createAttempt("child-only", child.child, worker.child);
+		worker.child.kill();
+		await worker.exited;
 		const result = await interruptRun({ ...ref, escalateAfterMs: 60_000, killAfterMs: 60_000 });
 		assert.equal(result.status, "interrupt-requested");
-		await waitUntil(() => !pidAlive(worker.child.pid), "the worker to stop");
+		await waitUntil(() => !pidAlive(child.child.pid), "the model child to stop");
 	}
 
 	// Every process gone after an interrupt: the attempt is finalized as cancelled.
