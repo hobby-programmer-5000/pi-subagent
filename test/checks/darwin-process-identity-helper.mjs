@@ -43,7 +43,12 @@ assert.deepEqual(manifest.architectures, ["arm64", "x86_64"]);
 assert.equal(manifest.minimumMacOS, "11.0");
 assert.match(manifest.compilerVersion, /clang/u);
 assert.match(manifest.sdkVersion, /^\d+(?:\.\d+)+$/u);
-assert.notEqual(binaryStat.mode & 0o111, 0, "native helper must be executable");
+if (process.platform === "win32")
+	console.log(
+		"native helper execute-bit check skipped: win32 file modes have no POSIX execute bit",
+	);
+else
+	assert.notEqual(binaryStat.mode & 0o111, 0, "native helper must be executable");
 
 assert.equal(binary.readUInt32BE(0), 0xcafebabe);
 const architectureCount = binary.readUInt32BE(4);
