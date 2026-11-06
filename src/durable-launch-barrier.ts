@@ -6,6 +6,25 @@ import { isAbsolute, join, resolve } from "node:path";
 const SHA256 = /^[a-f0-9]{64}$/u;
 const NONCE = /^[a-f0-9]{64}$/u;
 
+/**
+ * Native Windows support. Windows grants access through ACLs rather than POSIX
+ * mode bits (Node reports 0o666/0o777 there), so only the mode comparison is
+ * skipped on win32; type, link-count, uid (when available) and identity checks
+ * still apply. NTFS file IDs carry a reuse sequence in the high bits and can
+ * exceed Number.MAX_SAFE_INTEGER, so win32 directory identity keeps the low 53
+ * bits of the bigint ID (the full MFT record number) as a safe integer.
+ * POSIX behaviour is unchanged.
+ */
+const IS_WIN32 = process.platform === "win32";
+const SAFE_INO_MASK = (1n << 53n) - 1n;
+
+function hasOwnerOnlyMode(info: { mode: number }, mode: number): boolean {
+	return IS_WIN32 || (info.mode & 0o777) === mode;
+}
+
+/** Windows FlushFileBuffers needs write access, so fsync of a read-only handle fails with EPERM there. */
+const SYNCABLE_READ = IS_WIN32 ? constants.O_RDWR : constants.O_RDONLY;
+
 export class DurableLaunchBarrierError extends Error {
 	readonly failureKind = "guard_failure" as const;
 
@@ -262,14 +281,31 @@ async function assertOwnerOnlyDirectory(
 	}
 	if (!info.isDirectory() || info.isSymbolicLink())
 		throw new DurableLaunchBarrierError("durable launch barrier directory is not a real directory");
-	if ((info.mode & 0o777) !== 0o700)
+	if (!hasOwnerOnlyMode(info, 0o700))
 		throw new DurableLaunchBarrierError("durable launch barrier directory is not owner-only 0700");
 	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
 	if (uid !== undefined && info.uid !== uid)
 		throw new DurableLaunchBarrierError("durable launch barrier directory owner mismatch");
+	let inode = info.ino;
+	if (IS_WIN32) {
+		let big;
+		try {
+			big = await lstat(path, { bigint: true });
+		} catch (error) {
+			normalizePathGuardError(error, "directory identity");
+		}
+		// Both observations must name the same directory; a swap between the
+		// two lstat calls fails closed.
+		if (Number(big.ino) !== info.ino || Number(big.dev) !== info.dev || !big.isDirectory())
+			throw new DurableLaunchBarrierError("durable launch barrier directory was replaced");
+		// An instrumented or wrapped lstat may ignore { bigint: true }; a number
+		// ino is then already the best available identity.
+		const bigIno: bigint | number = big.ino;
+		inode = typeof bigIno === "bigint" ? Number(bigIno & SAFE_INO_MASK) : bigIno;
+	}
 	const identity = {
 		device: info.dev,
-		inode: info.ino,
+		inode,
 		...(uid === undefined ? {} : { uid }),
 	};
 	if (
@@ -286,6 +322,12 @@ async function syncDirectory(path: string): Promise<void> {
 	const handle = await open(path, constants.O_RDONLY);
 	try {
 		await handle.sync();
+	} catch (error) {
+		// Windows FlushFileBuffers needs write access, which a directory handle
+		// cannot have, so a directory fsync always fails with EPERM there. NTFS
+		// metadata updates are journaled; POSIX keeps the strict fsync.
+		if (!(IS_WIN32 && (error as NodeJS.ErrnoException)?.code === "EPERM"))
+			throw error;
 	} finally {
 		await handle.close();
 	}
@@ -341,8 +383,8 @@ async function assertTransactionLink(
 		finalInfo.ino !== transactionInfo.ino ||
 		finalInfo.nlink !== 2 ||
 		transactionInfo.nlink !== 2 ||
-		(finalInfo.mode & 0o777) !== 0o600 ||
-		(transactionInfo.mode & 0o777) !== 0o600 ||
+		!hasOwnerOnlyMode(finalInfo, 0o600) ||
+		!hasOwnerOnlyMode(transactionInfo, 0o600) ||
 		(uid !== undefined &&
 			(finalInfo.uid !== uid || transactionInfo.uid !== uid))
 	)
@@ -413,7 +455,7 @@ async function writeDurableExclusive(
 		await syncDirectory(descriptor.directory);
 		transaction = await open(
 			transactionPath,
-			constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+			SYNCABLE_READ | (constants.O_NOFOLLOW ?? 0),
 		);
 		const transactionBytes = await transaction.readFile();
 		if (!transactionBytes.equals(bytes))
@@ -464,7 +506,7 @@ async function pendingCommitExists(path: string): Promise<boolean> {
 			throw new DurableLaunchBarrierError(
 				"durable launch barrier pending fence identity mismatch",
 			);
-		if ((info.mode & 0o777) !== 0o600 || (uid !== undefined && info.uid !== uid))
+		if (!hasOwnerOnlyMode(info, 0o600) || (uid !== undefined && info.uid !== uid))
 			throw new DurableLaunchBarrierError(
 				"durable launch barrier pending fence identity mismatch",
 			);
@@ -495,7 +537,7 @@ async function recoverCommittedExclusive(
 	try {
 		transaction = await open(
 			transactionPath,
-			constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+			SYNCABLE_READ | (constants.O_NOFOLLOW ?? 0),
 		);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return false;
@@ -508,7 +550,7 @@ async function recoverCommittedExclusive(
 		if (
 			!info.isFile() ||
 			(info.nlink !== 1 && info.nlink !== 2) ||
-			(info.mode & 0o777) !== 0o600 ||
+			!hasOwnerOnlyMode(info, 0o600) ||
 			(uid !== undefined && info.uid !== uid)
 		)
 			throw new DurableLaunchBarrierError(
@@ -565,7 +607,7 @@ async function readStrictJson(
 		if (
 			!info.isFile() ||
 			(info.nlink !== 1 && info.nlink !== 2) ||
-			(info.mode & 0o777) !== 0o600 ||
+			!hasOwnerOnlyMode(info, 0o600) ||
 			(uid !== undefined && info.uid !== uid)
 		)
 			throw new DurableLaunchBarrierError("durable launch barrier file identity mismatch");

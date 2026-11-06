@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { renameReplacing } from "../core/replace-file.ts";
 import type {
 	AsyncDependency,
 	ExecutionMode,
@@ -489,7 +490,9 @@ async function writeRecordPath(
 	await mkdir(dirname(path), { recursive: true });
 	const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
 	await writeFile(tempPath, `${JSON.stringify(record, null, 2)}\n`);
-	await rename(tempPath, path);
+	// win32: retry while another process briefly holds run.json open.
+	if (process.platform === "win32") await renameReplacing(tempPath, path);
+	else await rename(tempPath, path);
 	return record;
 }
 

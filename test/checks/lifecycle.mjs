@@ -40,6 +40,13 @@ import {
 	runSubagent,
 	waitForSubagent,
 } from "../../api.mjs";
+import {
+	isWin32,
+	prependPath,
+	rmTree,
+	sleeperCommand,
+	useFakePiPackage,
+} from "../fixtures/platform-support.mjs";
 
 const cwd = await mkdtemp(join(tmpdir(), "pi-subagent-lifecycle-"));
 const originalPath = process.env.PATH;
@@ -170,7 +177,7 @@ try {
 	);
 	await discardSubagentExecution(stalePreparedB);
 
-	const finalizerWorker = spawn("/bin/sleep", ["30"], {
+	const finalizerWorker = spawn(...sleeperCommand(), {
 		detached: true,
 		stdio: "ignore",
 	});
@@ -178,7 +185,13 @@ try {
 	const finalizerWorkerIdentity = await captureProcessIdentity(
 		finalizerWorker.pid,
 	);
-	process.kill(-finalizerWorkerIdentity.processGroupId, "SIGKILL");
+	// Windows has no process groups; its identity group id is the pid itself.
+	process.kill(
+		isWin32
+			? finalizerWorkerIdentity.pid
+			: -finalizerWorkerIdentity.processGroupId,
+		"SIGKILL",
+	);
 	await new Promise((resolveExit) => finalizerWorker.once("exit", resolveExit));
 	const finalizerPath = fileURLToPath(
 		new URL("../../src/workers/terminal-finalizer.mjs", import.meta.url),
@@ -619,7 +632,7 @@ try {
 	// When the kernel refuses every initial signal with EPERM (macOS, zombie-only
 	// group), interrupt must report the attempt as unsupported rather than throw.
 	{
-		const epermTarget = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
+		const epermTarget = spawn(...sleeperCommand(), { detached: true, stdio: "ignore" });
 		const epermIdentity = await captureProcessIdentity(epermTarget.pid);
 		const epermRunId = "run_interrupt_eperm_target";
 		const epermAttemptId = "attempt_interrupt_eperm_target";
@@ -663,7 +676,7 @@ try {
 		realKill.call(process, epermTarget.pid, "SIGKILL");
 	}
 
-	const shortTarget = spawn("/bin/sleep", ["30"], {
+	const shortTarget = spawn(...sleeperCommand(), {
 		detached: true,
 		stdio: "ignore",
 	});
@@ -747,7 +760,8 @@ await new Promise((resolve) => setTimeout(resolve, 10000));
 `,
 		{ mode: 0o700 },
 	);
-	process.env.PATH = `${interruptBin}:${originalPath}`;
+	process.env.PATH = prependPath(interruptBin, originalPath);
+	const restoreFakePi = useFakePiPackage(join(interruptBin, "pi"), interruptBin);
 	const stubbornInterruptRun = await runSubagent({
 		cwd,
 		backend: "headless",
@@ -784,6 +798,7 @@ await new Promise((resolve) => setTimeout(resolve, 10000));
 	await new Promise((resolveSleep) => setTimeout(resolveSleep, 4_100));
 	assert.equal(await pathExists(stubbornLateSideEffect), false);
 	process.env.PATH = originalPath;
+	restoreFakePi();
 
 	console.log(
 		JSON.stringify({ name: "check-lifecycle", status: "completed" }, null, 2),
@@ -797,5 +812,5 @@ await new Promise((resolve) => setTimeout(resolve, 10000));
 			// The owned fixture process already exited.
 		}
 	}
-	await rm(cwd, { recursive: true, force: true });
+	await rmTree(cwd);
 }

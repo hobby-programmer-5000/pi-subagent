@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 
 import {
 	buildDurableWorkerBinding,
@@ -12,6 +13,8 @@ import {
 } from "../../src/workers/durable-worker-binding.mjs";
 
 const sha = (value) => createHash("sha256").update(value).digest("hex");
+// The worker hashes resolved paths; on Windows "/tmp/x" resolves to "C:\tmp\x".
+const shaPath = (value) => sha(resolve(value));
 const payload = {
 	runId: "run-binding",
 	attemptId: "attempt-binding",
@@ -56,8 +59,8 @@ assert.deepEqual(preflight, {
 	schema: "pi-subagent-durable-worker-binding-preflight-v1",
 	runId: payload.runId,
 	attemptId: payload.attemptId,
-	cwdSha256: sha(executionCwd),
-	runsDirSha256: sha("/tmp/binding-cwd/.pi/agent/runs"),
+	cwdSha256: shaPath(executionCwd),
+	runsDirSha256: shaPath("/tmp/binding-cwd/.pi/agent/runs"),
 	workerPid: 1234,
 	launchPayloadSha256: "7".repeat(64),
 	executionPlanSha256,
@@ -77,8 +80,8 @@ assert.deepEqual(binding, {
 	schema: "pi-subagent-durable-worker-binding-v1",
 	runId: payload.runId,
 	attemptId: payload.attemptId,
-	cwdSha256: sha(executionCwd),
-	runsDirSha256: sha("/tmp/binding-cwd/.pi/agent/runs"),
+	cwdSha256: shaPath(executionCwd),
+	runsDirSha256: shaPath("/tmp/binding-cwd/.pi/agent/runs"),
 	workerPid: 1234,
 	launchPayloadSha256: "7".repeat(64),
 	executionPlanSha256,
@@ -103,7 +106,7 @@ const correlated = prepareDurableWorkerBinding({
 	workerPid: 1234,
 });
 assert.equal(correlated.correlationId, "consumer:task-1");
-assert.equal(correlated.runsDirSha256, sha("/tmp/binding-cwd/.runs"));
+assert.equal(correlated.runsDirSha256, shaPath("/tmp/binding-cwd/.runs"));
 const installed = installDurableWorkerBinding({
 	payload,
 	launchPayloadSha256: "7".repeat(64),

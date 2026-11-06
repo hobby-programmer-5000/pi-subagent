@@ -6,9 +6,17 @@ import { join, resolve } from "node:path";
 import { createJiti } from "jiti";
 import { createAttemptArtifactStore } from "../../src/artifacts/store.ts";
 import { readAnswerPreview } from "../../src/artifacts/preview.ts";
+import {
+	canCreateSymlinks,
+	logSkip,
+	prependPath,
+	SYMLINK_SKIP_REASON,
+	useFakePiPackage,
+} from "../fixtures/platform-support.mjs";
 
 const cwd = await mkdtemp(join(tmpdir(), "pi-subagent-answer-preview-"));
 const oldPath = process.env.PATH;
+let restoreFakePi = () => {};
 const oldDelay = process.env.PI_SUBAGENT_DURABLE_WORKER_START_DELAY_MS;
 try {
 	const store = await createAttemptArtifactStore({ cwd, runId: "run_preview", attemptId: "attempt-1" });
@@ -35,9 +43,11 @@ try {
 	assert.equal(await readAnswerPreview(result), undefined);
 	const sibling = join(cwd, "private.txt");
 	await writeFile(sibling, "not output");
-	await symlink(sibling, path);
-	assert.equal(await readAnswerPreview(result), undefined, "do not follow symlinked artifacts");
-	await rm(path);
+	if (canCreateSymlinks()) {
+		await symlink(sibling, path);
+		assert.equal(await readAnswerPreview(result), undefined, "do not follow symlinked artifacts");
+		await rm(path);
+	} else logSkip("symlinked-artifact preview check", SYMLINK_SKIP_REASON);
 	await mkdir(path);
 	assert.equal(await readAnswerPreview(result), undefined, "reject non-regular output");
 	await rm(path, { recursive: true });
@@ -56,7 +66,8 @@ if (task.includes("hang")) {
 }
 `);
 	await chmod(fakePi, 0o700);
-	process.env.PATH = `${bin}:${oldPath ?? ""}`;
+	process.env.PATH = prependPath(bin, oldPath);
+	restoreFakePi = useFakePiPackage(fakePi, cwd);
 	const jiti = createJiti(import.meta.url, { interopDefault: true, moduleCache: false });
 	const module = await jiti.import(resolve("src/index.ts"));
 	let tool;
@@ -112,6 +123,7 @@ if (task.includes("hang")) {
 	assert.equal(persisted.answerPreview, undefined, "preview is derived, not a second result store");
 	console.log(JSON.stringify({ name: "check-answer-preview", status: "completed", providerCalls: 0 }));
 } finally {
+	restoreFakePi();
 	if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
 	if (oldDelay === undefined) delete process.env.PI_SUBAGENT_DURABLE_WORKER_START_DELAY_MS; else process.env.PI_SUBAGENT_DURABLE_WORKER_START_DELAY_MS = oldDelay;
 	await rm(cwd, { recursive: true, force: true });

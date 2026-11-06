@@ -329,7 +329,13 @@ export async function startAsyncSubagentRun(
 			],
 			{
 			cwd: options.cwd,
-			detached: process.platform !== "win32",
+			// The durable worker must outlive the Pi host. On Windows libuv puts
+			// non-detached children in a kill-on-close job object, so the worker
+			// (and its model process) died the moment the host exited; detach it
+			// there too. windowsHide keeps the detached child from opening a
+			// console window. POSIX was already detached.
+			detached: true,
+			windowsHide: true,
 			stdio: ["ignore", workerLogFd, workerLogFd],
 			env: workerEnv,
 			},

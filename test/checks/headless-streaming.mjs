@@ -25,6 +25,7 @@ import {
 	captureProcessIdentity,
 	verifyProcessIdentity,
 } from "../../src/process-identity.ts";
+import { fakePiOptions, isWin32, logSkip } from "../fixtures/platform-support.mjs";
 
 function artifactByType(result, type) {
 	const artifact = result.artifacts.find((candidate) => candidate.type === type);
@@ -46,7 +47,7 @@ async function withDisconnectedGate(check) {
 	};
 	childProcess.spawn = (...args) => {
 		const child = originalSpawn(...args);
-		if (args[1]?.[0]?.endsWith("/process-gate.mjs")) {
+		if (/[\\/]process-gate\.mjs$/u.test(args[1]?.[0] ?? "")) {
 			child.stdin.end = () => {
 				probe.writes += 1;
 				queueMicrotask(() => child.stdin.emit("error", probe.error));
@@ -92,26 +93,31 @@ const sleep = (ms) =>
 try {
 	const cwd = join(tempRoot, "workspace");
 	await mkdir(cwd, { recursive: true });
-	const execProbe = spawn(
-		"/bin/bash",
-		["-c", "IFS= read -r gate; exec /bin/sleep 30", "identity-exec-probe"],
-		{ detached: true, stdio: ["pipe", "ignore", "ignore"] },
-	);
-	assert.equal(typeof execProbe.pid, "number");
-	try {
-		const preExecIdentity = await captureProcessIdentity(execProbe.pid);
-		execProbe.stdin.end("go\n");
-		await sleep(100);
-		assert.equal(
-			await verifyProcessIdentity(preExecIdentity),
-			"alive",
-			"birth identity must remain stable across exec",
+	// exec() replaces a process image under the same pid; Windows has no exec.
+	if (isWin32)
+		logSkip("identity-across-exec probe", "win32 has no exec() or /bin/bash");
+	else {
+		const execProbe = spawn(
+			"/bin/bash",
+			["-c", "IFS= read -r gate; exec /bin/sleep 30", "identity-exec-probe"],
+			{ detached: true, stdio: ["pipe", "ignore", "ignore"] },
 		);
-	} finally {
+		assert.equal(typeof execProbe.pid, "number");
 		try {
-			process.kill(-execProbe.pid, "SIGKILL");
-		} catch {
-			// The owned identity probe already exited.
+			const preExecIdentity = await captureProcessIdentity(execProbe.pid);
+			execProbe.stdin.end("go\n");
+			await sleep(100);
+			assert.equal(
+				await verifyProcessIdentity(preExecIdentity),
+				"alive",
+				"birth identity must remain stable across exec",
+			);
+		} finally {
+			try {
+				process.kill(-execProbe.pid, "SIGKILL");
+			} catch {
+				// The owned identity probe already exited.
+			}
 		}
 	}
 	const fakePi = join(tempRoot, "fake-pi.mjs");
@@ -148,7 +154,7 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		cwd,
 		runId: "run_check_headless_env_unset",
 		attemptId: "attempt-env-unset",
-		piCommand: envPi,
+		...fakePiOptions(envPi),
 		agent: "env-worker",
 		task: "inspect env",
 	});
@@ -163,7 +169,7 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		cwd,
 		runId: "run_check_headless_env_explicit",
 		attemptId: "attempt-env-explicit",
-		piCommand: envPi,
+		...fakePiOptions(envPi),
 		agent: "env-worker",
 		task: "inspect env",
 		childEnv: { PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON: "current-binding" },
@@ -181,7 +187,7 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		cwd,
 		runId: "run_check_headless_streaming",
 		attemptId: "attempt-streaming",
-		piCommand: fakePi,
+		...fakePiOptions(fakePi),
 		agent: "stream-worker",
 		task: "emit a large event stream",
 		parentSessionId: "parent-session-1",
@@ -225,7 +231,7 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		cwd,
 		runId: "run_check_headless_tool_calls",
 		attemptId: "attempt-tool-calls",
-		piCommand: fakePi,
+		...fakePiOptions(fakePi),
 		agent: "stream-worker",
 		task: "emit a tool call stream",
 		timeoutMs: 30_000,
@@ -325,7 +331,7 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		cwd,
 		runId: "run_check_headless_non_fatal_error",
 		attemptId: "attempt-non-fatal-error",
-		piCommand: nonFatalErrorPi,
+		...fakePiOptions(nonFatalErrorPi),
 		agent: "stream-worker",
 		task: "emit a warning before final output",
 		timeoutMs: 30_000,
@@ -356,7 +362,7 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		cwd,
 		runId: "run_check_headless_recovered_context",
 		attemptId: "attempt-recovered-context",
-		piCommand: recoveredContextPi,
+		...fakePiOptions(recoveredContextPi),
 		agent: "stream-worker",
 		task: "recover from context overflow before final output",
 		timeoutMs: 30_000,
@@ -396,7 +402,7 @@ process.stdout.write(JSON.stringify({ type: "error", error: { message: "context_
 		cwd,
 		runId: "run_check_headless_terminal_context",
 		attemptId: "attempt-terminal-context",
-		piCommand: terminalContextPi,
+		...fakePiOptions(terminalContextPi),
 		agent: "stream-worker",
 		task: "fail after unrecovered context overflow",
 		timeoutMs: 30_000,
@@ -425,7 +431,7 @@ process.stdout.write(JSON.stringify({ type: "error", error: { message: "fatal st
 		cwd,
 		runId: "run_check_headless_fatal_error",
 		attemptId: "attempt-fatal-error",
-		piCommand: fatalErrorPi,
+		...fakePiOptions(fatalErrorPi),
 		agent: "stream-worker",
 		task: "emit only an error event",
 		timeoutMs: 30_000,
@@ -449,7 +455,7 @@ setInterval(() => undefined, 1000);
 		cwd,
 		runId: "run_check_headless_abort",
 		attemptId: "attempt-abort",
-		piCommand: abortPi,
+		...fakePiOptions(abortPi),
 		agent: "stream-worker",
 		task: "stay alive until aborted",
 		timeoutMs: 30_000,
@@ -467,7 +473,7 @@ setInterval(() => undefined, 1000);
 		cwd,
 		runId: "run_check_headless_user_cancelled",
 		attemptId: "attempt-user-cancelled",
-		piCommand: abortPi,
+		...fakePiOptions(abortPi),
 		agent: "stream-worker",
 		task: "stay alive until interrupted",
 		timeoutMs: 30_000,
@@ -488,7 +494,7 @@ setInterval(() => undefined, 1000);
 			const controller = new AbortController();
 			const result = await runHeadlessModel({
 				cwd,
-				piCommand: abortPi,
+				...fakePiOptions(abortPi),
 				agent: "stream-worker",
 				task: "never release an aborted ownership gate",
 				timeoutMs: 30_000,
@@ -511,7 +517,7 @@ setInterval(() => undefined, 1000);
 		await assert.rejects(
 			runHeadlessModel({
 				cwd,
-				piCommand: abortPi,
+				...fakePiOptions(abortPi),
 				agent: "stream-worker",
 				task: "unexpected pipe errors must still fail closed",
 				timeoutMs: 30_000,
@@ -524,41 +530,46 @@ setInterval(() => undefined, 1000);
 	// A process-group kill that fails with EPERM (seen on macOS while the leader
 	// exits) must not escape the abort listener; the runner falls back to
 	// signalling the child directly and still settles as cancelled.
-	const originalKill = process.kill;
-	let groupKillAttempts = 0;
-	process.kill = (pid, signal) => {
-		// Fail real group signals only; signal 0 liveness probes keep working.
-		if (typeof pid === "number" && pid < 0 && signal !== 0) {
-			groupKillAttempts += 1;
-			const error = new Error("kill EPERM");
-			error.code = "EPERM";
-			throw error;
+	// The runner signals POSIX process groups only; on win32 it signals the pid.
+	if (isWin32)
+		logSkip("process-group kill EPERM fallback", "win32 has no POSIX process groups");
+	else {
+		const originalKill = process.kill;
+		let groupKillAttempts = 0;
+		process.kill = (pid, signal) => {
+			// Fail real group signals only; signal 0 liveness probes keep working.
+			if (typeof pid === "number" && pid < 0 && signal !== 0) {
+				groupKillAttempts += 1;
+				const error = new Error("kill EPERM");
+				error.code = "EPERM";
+				throw error;
+			}
+			return originalKill.call(process, pid, signal);
+		};
+		try {
+			const epermController = new AbortController();
+			const epermAborted = await runHeadlessModel({
+				cwd,
+				runId: "run_check_headless_eperm",
+				attemptId: "attempt-eperm",
+				...fakePiOptions(abortPi),
+				agent: "stream-worker",
+				task: "stay alive until aborted despite EPERM",
+				timeoutMs: 30_000,
+				signal: epermController.signal,
+				onProcessStart: () => epermController.abort(),
+			});
+			assert.equal(epermAborted.status, "cancelled");
+			assert.equal(epermAborted.failureKind, "abort");
+			assert.ok(groupKillAttempts >= 1, "group kill was attempted");
+			const epermStderr = await readFile(
+				join(cwd, artifactByType(epermAborted, "stderr").path),
+				"utf8",
+			);
+			assert.match(epermStderr, /process-group kill failed: EPERM/u);
+		} finally {
+			process.kill = originalKill;
 		}
-		return originalKill.call(process, pid, signal);
-	};
-	try {
-		const epermController = new AbortController();
-		const epermAborted = await runHeadlessModel({
-			cwd,
-			runId: "run_check_headless_eperm",
-			attemptId: "attempt-eperm",
-			piCommand: abortPi,
-			agent: "stream-worker",
-			task: "stay alive until aborted despite EPERM",
-			timeoutMs: 30_000,
-			signal: epermController.signal,
-			onProcessStart: () => epermController.abort(),
-		});
-		assert.equal(epermAborted.status, "cancelled");
-		assert.equal(epermAborted.failureKind, "abort");
-		assert.ok(groupKillAttempts >= 1, "group kill was attempted");
-		const epermStderr = await readFile(
-			join(cwd, artifactByType(epermAborted, "stderr").path),
-			"utf8",
-		);
-		assert.match(epermStderr, /process-group kill failed: EPERM/u);
-	} finally {
-		process.kill = originalKill;
 	}
 	assert.equal(abortFailureKind(undefined), "abort");
 	assert.equal(abortFailureKind(interruptController.signal), "user_cancelled");
@@ -600,7 +611,7 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		cwd,
 		runId: "run_check_headless_gate",
 		attemptId: "attempt-headless-gate",
-		piCommand: gatedPi,
+		...fakePiOptions(gatedPi),
 		agent: "stream-worker",
 		task: "wait for ownership",
 		timeoutMs: 30_000,
@@ -648,7 +659,7 @@ writeFileSync(${JSON.stringify(rejectedSideEffect)}, "started");
 			cwd,
 			runId: "run_check_headless_gate_rejected",
 			attemptId: "attempt-headless-gate-rejected",
-			piCommand: gatedPi,
+			...fakePiOptions(gatedPi),
 			agent: "stream-worker",
 			task: "reject ownership",
 			timeoutMs: 30_000,
@@ -681,7 +692,7 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		cwd,
 		runId: "run_check_headless_stubborn_group",
 		attemptId: "attempt-headless-stubborn-group",
-		piCommand: stubbornPi,
+		...fakePiOptions(stubbornPi),
 		agent: "stream-worker",
 		task: "drain stubborn process group",
 		timeoutMs: 30_000,

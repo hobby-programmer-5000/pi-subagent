@@ -47,6 +47,21 @@ const canonical = (value) =>
 				)
 			: value;
 
+async function canCreateSymlink(directory) {
+	const target = join(directory, ".symlink-probe-target");
+	const alias = join(directory, ".symlink-probe");
+	try {
+		await writeFile(target, "");
+		await symlink(target, alias);
+		return true;
+	} catch {
+		return false;
+	} finally {
+		await rm(alias, { force: true });
+		await rm(target, { force: true });
+	}
+}
+
 const root = await mkdtemp(join(tmpdir(), "pi-subagent-launch-barrier-"));
 try {
 	const descriptor = await createDurableLaunchBarrier({
@@ -106,9 +121,10 @@ try {
 	let sequenceCalls = 0;
 	const runPendingSequence = async (first, second, third) => {
 		let calls = 0;
-		injectedLstat = async (path) => {
+		// Forward stat options: the win32 identity check passes { bigint: true }.
+		injectedLstat = async (path, ...options) => {
 			if (path !== `${interleaveBarrier.readyPath}.pending`)
-				return realPendingLstat(path);
+				return realPendingLstat(path, ...options);
 			calls += 1;
 			if (calls === 1) return first();
 			if (calls === 2) return second();
@@ -174,7 +190,14 @@ try {
 			return info;
 		}],
 	];
+	// Windows has no POSIX mode bits or uid (the barrier skips exactly those
+	// comparisons there), and symlinks need Developer Mode. nlink and
+	// non-regular cases still run on every platform.
+	const unsupportedOnPlatform = new Set(
+		process.platform === "win32" ? ["mode", "uid", ...((await canCreateSymlink(root)) ? [] : ["symlink"])] : [],
+	);
 	for (const [label, makeInvalid] of invalidCases) {
+		if (unsupportedOnPlatform.has(label)) continue;
 		await chmod(fixture, 0o600);
 		await assert.rejects(
 			runPendingSequence(makeInvalid, () => validInfo),

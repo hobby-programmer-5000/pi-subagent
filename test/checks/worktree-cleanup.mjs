@@ -17,8 +17,14 @@ import {
   finalizeWorktreeResult,
   resolveWorkspace,
 } from "../../src/workspace/worktree.ts";
+import {
+  isWin32,
+  logSkip,
+  pinGitLineEndings,
+} from "../fixtures/platform-support.mjs";
 
 const execFileAsync = promisify(execFile);
+pinGitLineEndings();
 
 async function pathExists(path) {
   try {
@@ -420,14 +426,21 @@ try {
 
   // Simulate high-cardinality status/stat output without creating 60,000
   // files in every static run. All other commands use the real Git binary.
-  const { stdout: gitPath } = await execFileAsync(
-    "/bin/sh",
-    ["-c", "command -v git"],
-    { encoding: "utf8" },
-  );
+  // Windows spawns git.exe directly, so a script named `git` on PATH cannot
+  // shadow it; skip this simulation there.
+  if (isWin32)
+    logSkip(
+      "large status/stat capture",
+      "win32 cannot shadow git.exe on PATH with a script",
+    );
+  const { stdout: gitPath } = isWin32
+    ? { stdout: "" }
+    : await execFileAsync("/bin/sh", ["-c", "command -v git"], {
+        encoding: "utf8",
+      });
   const bin = join(tempRoot, "large-output-bin");
   await mkdir(bin);
-  for (const kind of ["status", "stat"]) {
+  for (const kind of isWin32 ? [] : ["status", "stat"]) {
     const workspace = await resolveWorkspace({
       cwd: repo,
       input: { worktree: true },

@@ -16,12 +16,18 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { getSubagentLogs, runSubagent, waitForSubagent } from "../../api.mjs";
 import {
 	hostPiPackageRoot,
 	PI_PACKAGE_ROOT_ENV,
 } from "../../src/runners/inline.ts";
+import {
+	canCreateSymlinks,
+	isWin32,
+	logSkip,
+} from "../fixtures/platform-support.mjs";
 
 const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const originalArgv1 = process.argv[1];
@@ -69,11 +75,18 @@ try {
 	const otherRoot = await fakePiPackage(join(scratch, "other-pi"));
 	const notPi = await fakePiPackage(join(scratch, "not-pi"), "not-pi");
 	await mkdir(join(scratch, "bin"));
-	await symlink(join(hostRoot, "dist", "cli.js"), join(scratch, "bin", "pi"));
+	// A symlinked launcher is the POSIX global-install layout. The Windows
+	// `pi.cmd` shim runs `node <cli.js>`, so the host entry is the CLI file
+	// itself; use that layout when symlinks are unavailable.
+	const hostEntry = canCreateSymlinks()
+		? join(scratch, "bin", "pi")
+		: join(hostRoot, "dist", "cli.js");
+	if (canCreateSymlinks())
+		await symlink(join(hostRoot, "dist", "cli.js"), hostEntry);
 	const unrelatedEntry = join(scratch, "unrelated.mjs");
 	await writeFile(unrelatedEntry, "");
 
-	process.argv[1] = join(scratch, "bin", "pi");
+	process.argv[1] = hostEntry;
 	process.env[PI_PACKAGE_ROOT_ENV] = otherRoot;
 	assert.equal(hostPiPackageRoot(), hostRoot, "the running host entry wins");
 	process.argv[1] = unrelatedEntry;
@@ -89,24 +102,47 @@ try {
 
 	// End to end: a wrapper script shadows the real `pi` on PATH while this
 	// process stands in for the Pi host.
-	const realPi = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
-	assert.ok(
-		piPackageRootOf(realPi),
-		`could not locate ${PI_PACKAGE_NAME} from ${realPi}`,
-	);
-	const wrapperDir = join(scratch, "wrapper-bin");
-	await mkdir(wrapperDir);
-	const wrapper = join(wrapperDir, "pi");
-	await writeFile(
-		wrapper,
-		`#!/bin/sh\nexec "${process.execPath}" "${realPi}" "$@"\n`,
-	);
-	await chmod(wrapper, 0o755);
-	process.env.PATH = `${wrapperDir}${delimiter}${originalPath ?? ""}`;
-	assert.equal(
-		execFileSync("which", ["pi"], { encoding: "utf8" }).trim(),
-		wrapper,
-	);
+	let realPi;
+	if (isWin32) {
+		// Windows has no `which` or `#!/bin/sh` wrapper; the host is the Pi CLI
+		// entry that `pi.cmd` runs. Use the project's installed Pi package.
+		logSkip(
+			"PATH wrapper shadowing",
+			"win32 launches Pi through a .cmd shim, not a #!/bin/sh wrapper",
+		);
+		const root = join(
+			dirname(fileURLToPath(import.meta.url)),
+			"..",
+			"..",
+			"node_modules",
+			...PI_PACKAGE_NAME.split("/"),
+		);
+		const { bin } = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+		realPi = join(root, typeof bin === "string" ? bin : bin.pi);
+		assert.ok(
+			piPackageRootOf(realPi),
+			`could not locate ${PI_PACKAGE_NAME} from ${realPi}`,
+		);
+	} else {
+		realPi = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
+		assert.ok(
+			piPackageRootOf(realPi),
+			`could not locate ${PI_PACKAGE_NAME} from ${realPi}`,
+		);
+		const wrapperDir = join(scratch, "wrapper-bin");
+		await mkdir(wrapperDir);
+		const wrapper = join(wrapperDir, "pi");
+		await writeFile(
+			wrapper,
+			`#!/bin/sh\nexec "${process.execPath}" "${realPi}" "$@"\n`,
+		);
+		await chmod(wrapper, 0o755);
+		process.env.PATH = `${wrapperDir}${delimiter}${originalPath ?? ""}`;
+		assert.equal(
+			execFileSync("which", ["pi"], { encoding: "utf8" }).trim(),
+			wrapper,
+		);
+	}
 	process.argv[1] = realPi;
 	process.env.PI_SUBAGENT_RUN_INDEX_DIR = join(scratch, "run-index");
 

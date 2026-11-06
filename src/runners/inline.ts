@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { delimiter, dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildAgentSystemPrompt, type AgentDefinition } from "../agents.ts";
 import {
 	createAttemptArtifactStore,
@@ -151,7 +151,7 @@ function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
 	return timeoutMs;
 }
 
-function findPackageRoot(
+export function findPackageRoot(
 	startPath: string,
 	packageName: string,
 ): string | undefined {
@@ -271,6 +271,43 @@ export function hostPiPackageRoot(): string | undefined {
 	}
 }
 
+/**
+ * Fallback for launches outside a Pi host, such as a standalone supervisor
+ * process: there is no Pi entry in process.argv and no inherited root, and
+ * require.resolve cannot see the package because it exports only `import`.
+ * Look for the installed package the way the `pi` command would be found:
+ * in a node_modules directory above this package (bundled installs), then
+ * next to a `pi.cmd`/`pi` launcher on PATH (npm global installs keep
+ * node_modules beside the launcher on Windows).
+ */
+export function findInstalledWin32PiPackageRoot(): string | undefined {
+	const segments = PI_PACKAGE_NAME.split("/");
+	const candidate = (base: string): string | undefined => {
+		const root = join(base, "node_modules", ...segments);
+		try {
+			const manifest = JSON.parse(fs.readFileSync(join(root, "package.json"), "utf8")) as {
+				name?: unknown;
+			};
+			return manifest.name === PI_PACKAGE_NAME ? root : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+	let current = dirname(fileURLToPath(import.meta.url));
+	while (current !== dirname(current)) {
+		const found = candidate(current);
+		if (found !== undefined) return found;
+		current = dirname(current);
+	}
+	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
+		if (entry.length === 0) continue;
+		if (!fs.existsSync(join(entry, "pi.cmd")) && !fs.existsSync(join(entry, "pi"))) continue;
+		const found = candidate(entry);
+		if (found !== undefined) return found;
+	}
+	return undefined;
+}
+
 async function importFromPackageRoot(
 	packageRoot: string,
 ): Promise<SdkImportResult> {
@@ -296,6 +333,13 @@ async function importPiSdk(): Promise<SdkImportResult> {
 	} catch (projectError) {
 		const hostRoot = hostPiPackageRoot();
 		if (hostRoot !== undefined) return await importFromPackageRoot(hostRoot);
+		// Windows has no `which`, and npm's .bin launchers there are script
+		// shims, not symlinks into the package; look for the installed package
+		// the way the headless runner does. POSIX keeps the `which pi` lookup.
+		if (process.platform === "win32") {
+			const installedRoot = findInstalledWin32PiPackageRoot();
+			if (installedRoot !== undefined) return await importFromPackageRoot(installedRoot);
+		}
 		let piBin: string;
 		try {
 			piBin = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();

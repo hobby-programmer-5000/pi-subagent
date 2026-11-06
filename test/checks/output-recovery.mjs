@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { createResultEnvelope } from "../../src/artifacts/result.ts";
 import { runTmuxModel } from "../../src/runners/tmux.ts";
 import { assistantOutputFromParse, parsePiJsonLines, resolvePiJsonOutcome, runHeadlessModel } from "../../src/runners/headless-model.ts";
+import { fakePiOptions } from "../fixtures/platform-support.mjs";
 
 const completed = { status: "completed", failureKind: null, exitCode: 0, signal: null };
 const failed = { ...completed, status: "failed", failureKind: "timeout" };
@@ -28,7 +29,7 @@ try {
 	await writeFile(fakePi, `#!${process.execPath}\nconsole.log(${JSON.stringify(JSON.stringify(finding))});\nconsole.log(${JSON.stringify(JSON.stringify(toolOnly))});\nsetInterval(() => {}, 1000);\n`);
 	await chmod(fakePi, 0o700);
 	const output = result => readFile(join(cwd, result.artifacts.find(a => a.type === "output").path), "utf8");
-	const result = await runHeadlessModel({ cwd, piCommand: fakePi, agent: "fixture", task: "timeout", timeoutMs: 1000 });
+	const result = await runHeadlessModel({ cwd, ...fakePiOptions(fakePi), agent: "fixture", task: "timeout", timeoutMs: 1000 });
 	assert.equal(result.status, "failed");
 	assert.equal(result.failureKind, "timeout");
 	assert.equal(await output(result), "Supported finding before the tool wait");
@@ -37,7 +38,7 @@ try {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 1000);
 	try {
-		const aborted = await runHeadlessModel({ cwd, piCommand: fakePi, agent: "fixture", task: "abort", signal: controller.signal });
+		const aborted = await runHeadlessModel({ cwd, ...fakePiOptions(fakePi), agent: "fixture", task: "abort", signal: controller.signal });
 		assert.equal(aborted.status, "cancelled");
 		assert.equal(aborted.failureKind, "abort");
 		assert.equal(await output(aborted), "Supported finding before the tool wait");
@@ -46,7 +47,7 @@ try {
 
 	const tmuxAvailable = spawnSync("tmux", ["-V"], { stdio: "ignore" }).status === 0;
 	if (tmuxAvailable) {
-		const tmux = await runTmuxModel({ cwd, piCommand: fakePi, agent: "fixture", task: "tmux timeout", timeoutMs: 1000 });
+		const tmux = await runTmuxModel({ cwd, ...fakePiOptions(fakePi), agent: "fixture", task: "tmux timeout", timeoutMs: 1000 });
 		assert.equal(tmux.status, "failed");
 		assert.equal(tmux.failureKind, "timeout");
 		assert.equal(await output(tmux), "Supported finding before the tool wait");
@@ -57,7 +58,7 @@ try {
 
 	const marker = join(cwd, "launched");
 	await writeFile(fakePi, `#!${process.execPath}\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'should not launch');\n`);
-	const gated = await runHeadlessModel({ cwd, piCommand: fakePi, agent: "fixture", task: "deadline before release", timeoutMs: 100, onProcessStart: () => new Promise(resolve => setTimeout(resolve, 250)) });
+	const gated = await runHeadlessModel({ cwd, ...fakePiOptions(fakePi), agent: "fixture", task: "deadline before release", timeoutMs: 100, onProcessStart: () => new Promise(resolve => setTimeout(resolve, 250)) });
 	assert.equal(gated.failureKind, "timeout");
 	await assert.rejects(readFile(marker), { code: "ENOENT" });
 	assert.equal(gated.metadata.outputPartial, undefined);

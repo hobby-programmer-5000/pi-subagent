@@ -487,6 +487,22 @@ export async function reconcileSubagentRun(
 	)
 		return { status: "running", runId: options.runId, record };
 
+	// win32 identity checks start PowerShell and take about 0.5-2 s. A worker
+	// can write its terminal result and exit inside that window, after the
+	// result was read above as still running. Re-read it once before declaring
+	// the attempt stale; a terminal result now goes through the normal commit
+	// path above. POSIX liveness checks are fast enough that this window does
+	// not open, so POSIX behaviour is unchanged.
+	if (process.platform === "win32") {
+		const lateResult = await readAttemptResult(attempt, options.runId);
+		if (
+			lateResult !== null &&
+			lateResult.attemptId === attempt.attemptId &&
+			isTerminalStatus(lateResult.status)
+		)
+			return await reconcileSubagentRun(options);
+	}
+
 	if (!(await terminateAttemptOwnership(attempt)))
 		return cleanupBlockedResult(
 			options.runId,

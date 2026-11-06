@@ -25,6 +25,7 @@ import {
 } from "../../src/runners/tool-result-budget.ts";
 import toolResultBudgetExtension from "../../src/runners/tool-result-budget-extension.ts";
 import { validateResolveInput } from "../../src/core/validation.ts";
+import { fakePiOptions } from "../fixtures/platform-support.mjs";
 
 const EVICTION_MARKER = "[evicted tool result:";
 
@@ -370,7 +371,7 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		cwd,
 		runId: "run_trb_budget_off",
 		attemptId: "attempt-budget-off",
-		piCommand: plainPi,
+		...fakePiOptions(plainPi),
 		agent: "budget-worker",
 		task: "run without a budget",
 		timeoutMs: 30_000,
@@ -401,7 +402,7 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		cwd,
 		runId: "run_trb_invalid_budget",
 		attemptId: "attempt-invalid-budget",
-		piCommand: plainPi,
+		...fakePiOptions(plainPi),
 		agent: "budget-worker",
 		task: "run with an invalid budget",
 		timeoutMs: 30_000,
@@ -453,7 +454,7 @@ if (first) {
 		cwd,
 		runId: "run_trb_recovery",
 		attemptId: "attempt-recovery",
-		piCommand: recoveryPi,
+		...fakePiOptions(recoveryPi),
 		agent: "budget-worker",
 		task: "overflow then recover",
 		timeoutMs: 30_000,
@@ -509,7 +510,7 @@ process.stdout.write(JSON.stringify({ type: "error", error: { message: "context_
 		cwd,
 		runId: "run_trb_still_failing",
 		attemptId: "attempt-still-failing",
-		piCommand: alwaysFailPi,
+		...fakePiOptions(alwaysFailPi),
 		agent: "budget-worker",
 		task: "overflow twice",
 		timeoutMs: 30_000,
@@ -547,7 +548,7 @@ process.stdout.write(JSON.stringify({ type: "error", error: { message: "context_
 		cwd,
 		runId: "run_trb_no_evictable",
 		attemptId: "attempt-no-evictable",
-		piCommand: noEvictablePi,
+		...fakePiOptions(noEvictablePi),
 		agent: "budget-worker",
 		task: "overflow without evictable results",
 		timeoutMs: 30_000,
@@ -587,7 +588,7 @@ if (${JSON.stringify(scenario)} === "already-timed-out") {
 }
 `, "utf8");
 		await chmod(fakePi, 0o700);
-		const deadlineResult = await runHeadlessModel({ cwd, piCommand: fakePi, agent: "budget-worker", task: scenario, timeoutMs: scenario === "shared-deadline" ? 5000 : 1000, toolResultBudget: { maxTotalChars: 2000 } });
+		const deadlineResult = await runHeadlessModel({ cwd, ...fakePiOptions(fakePi), agent: "budget-worker", task: scenario, timeoutMs: scenario === "shared-deadline" ? 5000 : 1000, toolResultBudget: { maxTotalChars: 2000 } });
 		assert.equal(deadlineResult.status, "failed", scenario);
 		assert.equal(deadlineResult.failureKind, "timeout", scenario);
 		assert.equal(deadlineResult.metadata.contextRecovered, undefined);

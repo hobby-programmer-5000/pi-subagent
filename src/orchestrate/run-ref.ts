@@ -9,6 +9,7 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { renameReplacing } from "../core/replace-file.ts";
 
 const DEFAULT_RUNS_DIR = ".pi/agent/runs";
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
@@ -232,7 +233,9 @@ export async function writeRunLocator(
 	await mkdir(dirname(path), { recursive: true });
 	const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
 	await writeFile(tempPath, `${JSON.stringify(locator, null, 2)}\n`);
-	await rename(tempPath, path);
+	// win32: retry while another process briefly holds the locator open.
+	if (process.platform === "win32") await renameReplacing(tempPath, path);
+	else await rename(tempPath, path);
 	scheduleRunLocatorSweep();
 }
 

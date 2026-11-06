@@ -423,6 +423,33 @@ heartbeat = setInterval(() => {
 		.catch(() => undefined);
 }, heartbeatMs);
 heartbeat.unref?.();
+// Windows has no catchable SIGTERM, so a graceful interrupt there records the
+// request on the run instead of signalling this worker (see interruptRun).
+// Watch for it and cancel through the same path a POSIX SIGTERM takes; a
+// request older than this attempt belongs to an earlier one and is ignored.
+const win32InterruptPollMs = Math.max(
+	25,
+	Number.parseInt(process.env.PI_SUBAGENT_WIN32_INTERRUPT_POLL_MS ?? "200", 10) || 200,
+);
+const interruptWatch =
+	process.platform === "win32"
+		? setInterval(() => {
+				void artifacts.readRunRecord(runRef).then((record) => {
+					const requested = record?.interrupt;
+					if (requested === undefined || executionAbort.signal.aborted) return;
+					const attempt = record.attempts?.find(
+						(candidate) => candidate.attemptId === attemptId,
+					);
+					if (
+						typeof attempt?.startedAt === "string" &&
+						requested.requestedAt < attempt.startedAt
+					)
+						return;
+					requestCancel(requested.signal ?? "SIGTERM");
+				}, () => undefined);
+			}, win32InterruptPollMs)
+		: undefined;
+interruptWatch?.unref?.();
 try {
 	await maybeDelayStartForTests();
 	if (executionAbort.signal.aborted) {
@@ -542,6 +569,7 @@ try {
 	}
 } finally {
 	if (heartbeat !== undefined) clearInterval(heartbeat);
+	if (interruptWatch !== undefined) clearInterval(interruptWatch);
 }
 if (terminalResult !== undefined) {
 	spawnTerminalFinalizer({

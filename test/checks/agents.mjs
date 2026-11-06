@@ -7,9 +7,11 @@ import { buildAgentSystemPrompt, loadAgentByName } from "../../src/agents.ts";
 import { buildPiArgv } from "../../src/runners/headless-model.ts";
 import { runSubagent, SubagentValidationError } from "../../api.mjs";
 import { createJiti } from "jiti";
+import { prependPath, useFakePiPackage } from "../fixtures/platform-support.mjs";
 
 const tempRoot = await mkdtemp(join(tmpdir(), "pi-subagent-agents-"));
 const originalPath = process.env.PATH;
+let restoreFakePi = () => {};
 try {
 	const sharedAgentsDir = join(tempRoot, ".pi", "agents");
 	await mkdir(sharedAgentsDir, { recursive: true });
@@ -334,7 +336,8 @@ OPEN_AGENT_PROMPT_MARKER
 		`#!${process.execPath}\nconsole.log(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text:"approval-ok"}],stopReason:"stop"}}));\n`,
 		{ mode: 0o755 },
 	);
-	process.env.PATH = `${bin}:${originalPath}`;
+	process.env.PATH = prependPath(bin, originalPath);
+	restoreFakePi = useFakePiPackage(join(bin, "pi"), tempRoot);
 	const jiti = createJiti(import.meta.url, { interopDefault: true });
 	const extension = await jiti.import("../../src/index.ts");
 	let tool;
@@ -475,6 +478,7 @@ OPEN_AGENT_PROMPT_MARKER
 		),
 	);
 } finally {
+	restoreFakePi();
 	if (originalPath === undefined) delete process.env.PATH;
 	else process.env.PATH = originalPath;
 	await rm(tempRoot, { recursive: true, force: true });

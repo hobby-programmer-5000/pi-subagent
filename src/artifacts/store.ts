@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { appendFile, mkdir, rename, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { renameReplacing } from "../core/replace-file.ts";
 import {
   createResultEnvelope,
   mergeArtifactRefs,
@@ -147,7 +148,9 @@ export async function createAttemptArtifactStore(options: CreateAttemptArtifactS
     const resultPath = pathFor("result");
     const tempPath = `${resultPath}.${process.pid}.${Date.now()}.tmp`;
     await writeFile(tempPath, `${JSON.stringify(result, null, 2)}\n`);
-    await rename(tempPath, resultPath);
+    // win32: retry while another process briefly holds result.json open.
+    if (process.platform === "win32") await renameReplacing(tempPath, resultPath);
+    else await rename(tempPath, resultPath);
     return result;
   }
 
