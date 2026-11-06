@@ -1,11 +1,15 @@
 import { once } from "node:events";
 import { createReadStream, createWriteStream, existsSync, readFileSync } from "node:fs";
 import { readFile, realpath, stat, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { findPackageRoot, hostPiPackageRoot } from "./inline.ts";
+import {
+	findInstalledWin32PiPackageRoot,
+	findPackageRoot,
+	hostPiPackageRoot,
+} from "./inline.ts";
 import { buildAgentSystemPrompt, type AgentDefinition } from "../agents.ts";
 import {
 	createAttemptArtifactStore,
@@ -592,40 +596,29 @@ function buildPrompt(options: RunHeadlessModelOptions): string {
 const PI_CODING_AGENT_PACKAGE = "@earendil-works/pi-coding-agent";
 
 /**
- * Fallback for launches outside a Pi host, such as a standalone supervisor
- * process: there is no Pi entry in process.argv and no inherited root, and
- * require.resolve cannot see the package because it exports only `import`.
- * Look for the installed package the way the `pi` command would be found:
- * in a node_modules directory above this package (bundled installs), then
- * next to a `pi.cmd`/`pi` launcher on PATH (npm global installs keep
- * node_modules beside the launcher on Windows).
+ * Native Windows: force-terminate a process and every descendant it started,
+ * the stand-in for a POSIX process-group kill. taskkill walks the tree from
+ * the live parent, so it must run before the parent exits. Throws ESRCH when
+ * the process is already gone, and any other failure so the caller can fall
+ * back to terminating the process alone.
  */
-function findInstalledWin32PiPackageRoot(): string | undefined {
-	const segments = PI_CODING_AGENT_PACKAGE.split("/");
-	const candidate = (base: string): string | undefined => {
-		const root = join(base, "node_modules", ...segments);
-		try {
-			const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
-				name?: unknown;
-			};
-			return manifest.name === PI_CODING_AGENT_PACKAGE ? root : undefined;
-		} catch {
-			return undefined;
-		}
-	};
-	let current = dirname(fileURLToPath(import.meta.url));
-	while (current !== dirname(current)) {
-		const found = candidate(current);
-		if (found !== undefined) return found;
-		current = dirname(current);
-	}
-	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
-		if (entry.length === 0) continue;
-		if (!existsSync(join(entry, "pi.cmd")) && !existsSync(join(entry, "pi"))) continue;
-		const found = candidate(entry);
-		if (found !== undefined) return found;
-	}
-	return undefined;
+function terminateWin32ProcessTree(pid: number): void {
+	const taskkill = join(
+		process.env.SystemRoot ?? "C:\\Windows",
+		"System32",
+		"taskkill.exe",
+	);
+	const result = spawnSync(taskkill, ["/PID", String(pid), "/T", "/F"], {
+		stdio: "ignore",
+		windowsHide: true,
+		timeout: 10_000,
+	});
+	if (result.error !== undefined) throw result.error;
+	// 128: no such process.
+	if (result.status === 128)
+		throw Object.assign(new Error(`process ${pid} not found`), { code: "ESRCH" });
+	if (result.status !== 0)
+		throw new Error(`taskkill /T exited with ${String(result.status)}`);
 }
 
 function resolveWin32PiCliEntry(): string {
@@ -890,6 +883,13 @@ async function runProcess(
 			if (authorizedProcessGroupId !== undefined && process.platform !== "win32") {
 				const processGroupId = authorizedProcessGroupId;
 				attempts.push(() => process.kill(-processGroupId, signal));
+			}
+			// Windows has no process groups, and child.kill() terminates only the
+			// child, so tool subprocesses it started would outlive it. Terminate
+			// the child's whole tree instead (any signal is a forced stop there).
+			if (process.platform === "win32" && child.pid !== undefined) {
+				const childPid = child.pid;
+				attempts.push(() => terminateWin32ProcessTree(childPid));
 			}
 			attempts.push(() => {
 				child.kill(signal);
